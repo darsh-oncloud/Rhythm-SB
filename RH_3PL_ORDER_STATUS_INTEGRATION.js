@@ -9,6 +9,10 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
     var BODY_STATUS_FIELD = 'custbody_3pl_export_status';
     var LINE_STATUS_FIELD = 'custcol_3pl_export_status';
 
+    // New decimal field on Sales Order body
+    // Replace with actual field ID if different
+    var BODY_3PL_COUNT_FIELD = 'custbody_3pl_order_count';
+
     var STATUS_READY = '1';
     var STATUS_SENT = '2';
     var STATUS_ERROR = '3';
@@ -73,7 +77,12 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
                 fieldId: BODY_STATUS_FIELD
             }) || '');
 
-            if (isProtectedStatus(bodyStatus)) {
+            /*
+             * Body protected statuses.
+             * Do not process full Sent, Error, Fulfilled, Manual Hold.
+             * Partial Sent is NOT protected because later remaining line can become Ready.
+             */
+            if (isProtectedBodyStatus(bodyStatus)) {
                 log.audit('BODY STATUS SKIPPED', {
                     soId: soId,
                     bodyStatus: bodyStatus
@@ -86,29 +95,25 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
             });
 
             var changed = false;
-            var hasEligibleLine = false;
-            var hasReadyOrPartial = false;
-            var allEligibleLinesReady = true;
+
+            var hasProcessLine = false;
+            var hasReadyLine = false;
+            var hasSentLine = false;
+            var hasBlankLine = false;
 
             for (var i = 0; i < lineCount; i++) {
 
-                var quantity = Number(soRec.getSublistValue({
+                var quantity = toNumber(soRec.getSublistValue({
                     sublistId: 'item',
                     fieldId: 'quantity',
                     line: i
-                }) || 0);
+                }));
 
-                var quantityCommitted = Number(soRec.getSublistValue({
+                var quantityCommitted = toNumber(soRec.getSublistValue({
                     sublistId: 'item',
                     fieldId: 'quantitycommitted',
                     line: i
-                }) || 0);
-
-                var quantityFulfilled = Number(soRec.getSublistValue({
-                    sublistId: 'item',
-                    fieldId: 'quantityfulfilled',
-                    line: i
-                }) || 0);
+                }));
 
                 var currentLineStatus = String(soRec.getSublistValue({
                     sublistId: 'item',
@@ -116,30 +121,52 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
                     line: i
                 }) || '');
 
-                if (isProtectedStatus(currentLineStatus)) {
+                /*
+                 * Sent/Error/Fulfilled/Manual Hold lines should not be changed.
+                 * But Sent line is still used for header calculation.
+                 */
+                if (currentLineStatus === STATUS_SENT) {
+                    hasProcessLine = true;
+                    hasSentLine = true;
+
+                    log.debug('LINE ALREADY SENT - NOT TOUCHED', {
+                        soId: soId,
+                        line: i,
+                        currentLineStatus: currentLineStatus
+                    });
+
                     continue;
                 }
 
-                hasEligibleLine = true;
+                if (isHardProtectedLineStatus(currentLineStatus)) {
+                    log.debug('LINE PROTECTED - NOT TOUCHED', {
+                        soId: soId,
+                        line: i,
+                        currentLineStatus: currentLineStatus
+                    });
+
+                    continue;
+                }
+
+                hasProcessLine = true;
 
                 var targetLineStatus = '';
 
-                if (quantityCommitted > 0) {
-                    if ((quantityCommitted + quantityFulfilled) >= quantity) {
-                        targetLineStatus = STATUS_READY;
-                    } else {
-                        targetLineStatus = STATUS_PARTIAL_READY;
-                    }
+                /*
+                 * New line logic:
+                 * Ordered Qty = Committed Qty  => Ready To Send
+                 * Ordered Qty != Committed Qty => Blank
+                 */
+                if (quantity > 0 && isSameQty(quantity, quantityCommitted)) {
+                    targetLineStatus = STATUS_READY;
                 } else {
                     targetLineStatus = '';
                 }
 
-                if (targetLineStatus === STATUS_READY || targetLineStatus === STATUS_PARTIAL_READY) {
-                    hasReadyOrPartial = true;
-                }
-
-                if (targetLineStatus !== STATUS_READY) {
-                    allEligibleLinesReady = false;
+                if (targetLineStatus === STATUS_READY) {
+                    hasReadyLine = true;
+                } else {
+                    hasBlankLine = true;
                 }
 
                 if (currentLineStatus !== targetLineStatus) {
@@ -157,35 +184,111 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
                         line: i,
                         quantity: quantity,
                         quantityCommitted: quantityCommitted,
-                        quantityFulfilled: quantityFulfilled,
                         oldStatus: currentLineStatus,
                         newStatus: targetLineStatus
                     });
                 }
             }
 
-            var newBodyStatus = '';
+            var newBodyStatus = bodyStatus;
+            var shouldUpdateBodyStatus = false;
 
-            if (hasEligibleLine && allEligibleLinesReady) {
-                newBodyStatus = STATUS_READY;
-            } else if (hasEligibleLine && hasReadyOrPartial) {
-                newBodyStatus = STATUS_PARTIAL_READY;
-            } else {
-                newBodyStatus = '';
+            /*
+             * Header logic:
+             *
+             * Ready + Ready  => Ready To Send
+             * Ready + Blank  => Partly Ready
+             * Sent + Ready   => Ready To Send
+             * Sent + Blank   => Do not touch header
+             */
+            if (hasProcessLine) {
+
+                if (hasReadyLine && !hasBlankLine) {
+                    // Ready + Ready
+                    // Sent + Ready
+                    newBodyStatus = STATUS_READY;
+                    shouldUpdateBodyStatus = true;
+
+                } else if (hasReadyLine && hasBlankLine && !hasSentLine) {
+                    // Ready + Blank
+                    newBodyStatus = STATUS_PARTIAL_READY;
+                    shouldUpdateBodyStatus = true;
+
+                } else if (hasReadyLine && hasBlankLine && hasSentLine) {
+                    /*
+                     * Sent + Ready + Blank
+                     * This means some lines sent, some ready, some still not ready.
+                     * Based on your simple flow, keep it Partly Ready so the ready line can go.
+                     */
+                    newBodyStatus = STATUS_PARTIAL_READY;
+                    shouldUpdateBodyStatus = true;
+
+                } else if (hasSentLine && hasBlankLine && !hasReadyLine) {
+                    // Sent + Blank = do not touch header
+                    shouldUpdateBodyStatus = false;
+
+                    log.debug('HEADER NOT TOUCHED - SENT + BLANK', {
+                        soId: soId,
+                        currentBodyStatus: bodyStatus
+                    });
+
+                } else {
+                    // Blank only = blank header
+                    newBodyStatus = '';
+                    shouldUpdateBodyStatus = true;
+                }
             }
 
-            if (bodyStatus !== newBodyStatus) {
+            var bodyStatusChanged = false;
+
+            if (shouldUpdateBodyStatus && bodyStatus !== newBodyStatus) {
                 soRec.setValue({
                     fieldId: BODY_STATUS_FIELD,
                     value: newBodyStatus
                 });
 
                 changed = true;
+                bodyStatusChanged = true;
 
                 log.debug('BODY STATUS UPDATED', {
                     soId: soId,
                     oldStatus: bodyStatus,
                     newStatus: newBodyStatus
+                });
+            }
+
+            /*
+             * 3PL Count Logic:
+             * Increase count only when header status changes to:
+             * - Ready To Send
+             * - Partly Ready
+             */
+            if (
+                bodyStatusChanged &&
+                (
+                    newBodyStatus === STATUS_READY ||
+                    newBodyStatus === STATUS_PARTIAL_READY
+                )
+            ) {
+                var oldCount = toNumber(soRec.getValue({
+                    fieldId: BODY_3PL_COUNT_FIELD
+                }));
+
+                var newCount = oldCount + 1;
+
+                soRec.setValue({
+                    fieldId: BODY_3PL_COUNT_FIELD,
+                    value: newCount
+                });
+
+                changed = true;
+
+                log.debug('3PL COUNT UPDATED', {
+                    soId: soId,
+                    oldCount: oldCount,
+                    newCount: newCount,
+                    oldBodyStatus: bodyStatus,
+                    newBodyStatus: newBodyStatus
                 });
             }
 
@@ -198,11 +301,13 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
                 log.audit('SALES ORDER SAVED', {
                     soId: soId,
                     saveId: saveId,
+                    oldBodyStatus: bodyStatus,
                     newBodyStatus: newBodyStatus
                 });
             } else {
                 log.debug('NO CHANGE', {
-                    soId: soId
+                    soId: soId,
+                    bodyStatus: bodyStatus
                 });
             }
 
@@ -215,7 +320,7 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
         }
     }
 
-    function isProtectedStatus(status) {
+    function isProtectedBodyStatus(status) {
         status = String(status || '');
 
         return (
@@ -224,6 +329,28 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
             status === STATUS_FULFILLED ||
             status === STATUS_MANUAL_HOLD
         );
+    }
+
+    function isHardProtectedLineStatus(status) {
+        status = String(status || '');
+
+        return (
+            status === STATUS_ERROR ||
+            status === STATUS_FULFILLED ||
+            status === STATUS_MANUAL_HOLD
+        );
+    }
+
+    function toNumber(value) {
+        var num = Number(value || 0);
+        return isNaN(num) ? 0 : num;
+    }
+
+    function isSameQty(qty1, qty2) {
+        qty1 = toNumber(qty1);
+        qty2 = toNumber(qty2);
+
+        return Math.abs(qty1 - qty2) < 0.000001;
     }
 
     function summarize(summary) {
