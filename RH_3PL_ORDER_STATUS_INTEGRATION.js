@@ -257,40 +257,40 @@ define(['N/search', 'N/record', 'N/log'], function (search, record, log) {
                 });
             }
 
-            /*
-             * 3PL Count Logic:
-             * Increase count only when header status changes to:
-             * - Ready To Send
-             * - Partly Ready
-             */
-            if (
-                bodyStatusChanged &&
-                (
-                    newBodyStatus === STATUS_READY ||
-                    newBodyStatus === STATUS_PARTIAL_READY
-                )
-            ) {
-                var oldCount = toNumber(soRec.getValue({
-                    fieldId: BODY_3PL_COUNT_FIELD
-                }));
+            // /*
+            //  * 3PL Count Logic:
+            //  * Increase count only when header status changes to:
+            //  * - Ready To Send
+            //  * - Partly Ready
+            //  */
+            // if (
+            //     bodyStatusChanged &&
+            //     (
+            //         newBodyStatus === STATUS_READY ||
+            //         newBodyStatus === STATUS_PARTIAL_READY
+            //     )
+            // ) {
+            //     var oldCount = toNumber(soRec.getValue({
+            //         fieldId: BODY_3PL_COUNT_FIELD
+            //     }));
 
-                var newCount = oldCount + 1;
+            //     var newCount = oldCount + 1;
 
-                soRec.setValue({
-                    fieldId: BODY_3PL_COUNT_FIELD,
-                    value: newCount
-                });
+            //     soRec.setValue({
+            //         fieldId: BODY_3PL_COUNT_FIELD,
+            //         value: newCount
+            //     });
 
-                changed = true;
+            //     changed = true;
 
-                log.debug('3PL COUNT UPDATED', {
-                    soId: soId,
-                    oldCount: oldCount,
-                    newCount: newCount,
-                    oldBodyStatus: bodyStatus,
-                    newBodyStatus: newBodyStatus
-                });
-            }
+            //     log.debug('3PL COUNT UPDATED', {
+            //         soId: soId,
+            //         oldCount: oldCount,
+            //         newCount: newCount,
+            //         oldBodyStatus: bodyStatus,
+            //         newBodyStatus: newBodyStatus
+            //     });
+            // }
 
             if (changed) {
                 var saveId = soRec.save({
